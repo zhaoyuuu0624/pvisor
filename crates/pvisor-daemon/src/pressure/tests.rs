@@ -288,7 +288,10 @@ async fn ordinary_files_cannot_impersonate_cgroup_accounting() {
     let mut config = config();
     config.cgroup_root = root.path().canonicalize().unwrap();
     let state = root.path().join("state");
-    let error = super::serve(state.clone(), config).await.unwrap_err();
+    use crate::api::{PressureScheduler, PressureService};
+    let error = PressureScheduler::serve(state.clone(), config)
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("not a cgroup v2 filesystem"));
     assert!(!state.exists(), "invalid accounting must not create state");
 }
