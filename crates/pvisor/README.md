@@ -579,7 +579,11 @@ Checkpoint restoration/fork starts a new owner directly. Durable operations take
 exclusive `flock` on the Session root's `session.lock`: same UID, `0600`, one hard link,
 no symlink. Its diagnostic record names the lock protocol, PID and operation;
 unknown disk schemas refuse mutation. Different compatible binaries share this
-lock. Residual lock metadata is cleared only after its process has died and no
+lock. Stopped status/review use `SessionDirectoryLock::acquire_read`: the same
+exclusive lock and owner validation, but no diagnostic owner write, truncate or
+fsync. A missing legacy lock inode may be initialized. Existing residual owner
+bytes are preserved, and required completion reconciliation remains durable.
+Residual lock metadata is cleared only after its process has died and no
 valid live owner remains. Apply/drop refuse a valid owner that still holds stage;
 the Execution lease remains an additional fence. Read-only inspect uses the stage's
 ordered lower-mutability declaration; absent or rebound declarations use Mutable.
@@ -1199,6 +1203,66 @@ OpenSandbox/E2B core flows; see its README for exact coverage. Full SDK conforma
 and production density remain unvalidated.
 
 ## Independent container VM lifecycle
+
+`docker::Create.managed_memory` is an explicit Linux x86-64 opt-in for a
+cooperative pressure scheduler. It preserves ordinary OCI image resolution,
+V2 caches, overlays, guest exec and the existing per-container owner. It adds a
+private raw (uncompressed) RAM file and a same-UID host-only control socket for
+that exact container ID/launch generation. `docker::managed` exposes Status,
+Offload-with-existing-backing and Resume using the existing `VmControl`; it
+neither invents a Session nor converts the image to a template. Omission leaves
+the ordinary anonymous-RAM launch unchanged. Shared kernel RAM conflicts; physical pools require the explicit managed-sharing profile below.
+The private backing is an unlinked SSD file retained by live VM descriptors;
+process exit releases it even without Rust destructors. Its `/proc/PID/fd/N`
+report is a live diagnostic locator, never a reusable checkpoint. The owner
+retires the generation control socket only after reaping its VMM.
+
+`Create.managed_memory_compression` additionally selects the existing compressed
+RAM store and a private FUSE mapping; it requires `managed_memory` and host FUSE
+support. This is default-off, persists in container configuration, and does not
+change OCI image preparation or scheduler policy. Setup failure is explicit:
+there is no raw-backing fallback. After native CPU/device writeback and reclaim,
+the same serialized control worker drains the logical backing and commits the
+compressed generation before acknowledging Offloaded. Resume cannot overtake
+publication; a drain/commit error fences subsequent controls until teardown.
+The native RAM report precedes compression and is not a measurement of net host
+memory saved. Compression CPU, staging I/O and page-cache charges remain real costs.
+
+Compressed RAM generation chains still compact into an independent full base at
+8 layers. During compaction, unchanged immutable fill blocks (zero or nonzero)
+reuse their descriptors after validating the decoded checksum once per distinct
+length/fill value and comparing every inherited checksum. Short region tails
+remain distinct. Dirty blocks, partial zero overrides and non-fill blocks retain
+the existing reader, validation and encoding path. This avoids materializing
+large unchanged zero ranges while preserving the format, full-base identity,
+publication ordering, depth bound and ancestor ownership. The caller's dirty
+set must still cover every changed block in a stable epoch.
+`PVISOR_DIAG_COMMIT=1` adds parent/result chain depths to capture timing records.
+The ignored `sparse_compaction_mechanism_probe` compares the former full-reader
+path and clean-fill reuse with identical 512 MiB logical contents and head IDs;
+it is a storage mechanism probe, not evidence of VM density or UKSM savings.
+
+Compressed staging, immutable layers and the FUSE mount are private to this launch
+under the instance directory. The existing container owner retains the FUSE mount outside the VMM process,
+which uses `_exit`. A private inherited socketpair fences generation/inode handoff
+and compressed publication; no new image or launch path is introduced. The owner
+reaps the VMM before joining publication and releasing the mount. A child-channel
+disconnect does not release backing ownership. This does not turn stalled native
+I/O into successful teardown.
+Normal destruction unmounts before removing storage; forced process death can leave
+mounts/files which the external owner must independently audit. No durable checkpoint
+or crash recovery is provided. Unit storage/protocol tests are not Linux KVM/FUSE
+acceptance or evidence of improved density; qualify this opt-in before deployment.
+
+This is cooperative: an external owner must reserve memory before launch, bind
+the exact generation and cgroup, declare only process-clean safe waits, and keep
+all tool/attachment/background traffic behind scheduler permits. No timer or
+automatic enrollment is enabled by the flag alone. Native Resume acknowledgement
+is not guest-service readiness: check the existing guest control channel before
+dispatch. Control loss or native failure is uncertain, with no automatic retry;
+retain capacity until independent VM/cgroup/mount teardown. Ordinary direct
+`exec` must not bypass the cooperative owner during a managed wait.
+
 
 On Apple Silicon, a daemon started with `--memory-pool-mode physical-pages`
 provides native 16 KiB physical slots through the same pool socket. The runner
@@ -2415,6 +2479,16 @@ blocks retain the original path. Generic capture and compaction still read all
 required content, including clean ancestors. The complete index, on-disk format,
 mmap writeback drain, durability and resume barriers remain unchanged.
 
+Compressed staging also supports explicit aligned zero ranges for managed
+shared-backing reattachment. A page mask overrides both old staged data and
+immutable ancestors without writing zero payloads to staging. Later partial
+writes preserve the surrounding zeros; publication and compaction encode them
+using the existing generation format. Failure still fences the store, retains
+pending overrides and leaves the previous durable head readable. Linux FUSE
+hole punching performs cache drain/invalidation; calling the store alone does
+not invalidate a mapped logical inode. This removes unnecessary zero staging,
+not compression work on nonzero COW pages or a measured end-to-end latency claim.
+
 ### Protected clean workspace seeds
 
 Linux native Raw version-1 restore can retain one immutable workspace lower
@@ -2521,6 +2595,38 @@ node-owned views, compressed snapshots and other platforms retain their previous
 path. This optimization does not enable offload on restored COW memory and does
 not promise a measured total-memory saving before workload validation.
 
+### Experimental managed physical sharing
+
+On Linux x86-64, ordinary OCI `--managed-memory --memory-pool SOCKET`
+combines physical sharing with daemon-controlled offload. Managed RAM uses an
+owned file backing; compression remains independently optional through
+`--managed-memory-compression`. The physical pool is negotiated before VM
+construction. Nonphysical pools fail startup without fallback or reconnection.
+Before reclaim, replaced pages (including private COW writes and zero pages)
+are reattached under the CPU/device barrier. Only successful native reclaim
+permits compressed publication and an offloaded acknowledgement. A reattachment
+failure fences further controls; it is not reported as a successful offload.
+Scans skip paused/offloaded VMs, and stale in-flight publications cannot replace
+reattached pages. Ordinary non-managed sharing keeps its anonymous RAM path.
+
+This integration does not change daemon watermarks, writeback limits, admission,
+or restore reservations. It does not implement automatic switching between
+sharing and offload, and does not establish a performance benefit. Linux mmap,
+reclaim and real-VM recovery validation is required before deployment.
+
+For local, host-only compatibility checks on macOS hosts without `mise` and
+`cargo-nextest`, the special fallback runner is serial libtest:
+`cargo test -p pvisor --lib executor::vm::pager::tests -- --test-threads=1`
+and `cargo test -p pvisor --lib docker::managed::tests -- --test-threads=1`.
+CLI parser tests (`-p pvisor-cli --lib cli::docker::tests`) and VM public
+contract tests (`-p pvisor-vm --test api_contract`) use the same serial runner.
+Internal handle tests (`-p pvisor-vm --lib handle::shared_backing_tests`) and
+API boundary guards (`-p pvisor-vm --test api_boundary`) use that runner too.
+The configuration matrix (`-p pvisor --lib
+docker::tests::managed_shared_pool_acceptance_is_independent_of_compression`)
+also uses this runner. These checks start no VM; they do not exercise Linux reattachment or FUSE.
+Use the standard runner when it is installed, and validate Linux-specific
+`shared_backing_` tests separately before any real workload experiment.
 ### Existing immutable OCI pool objects
 
 Filesystem object publication detects an existing regular object before writing
@@ -2582,3 +2688,77 @@ Execution preparation binds VM Gateway proxies to Core's VM resolved-address
 constraints, even when LLM Gateway dispatch is disabled. Injected HTTP/HTTPS/ALL
 proxy routes therefore cannot widen direct VM egress to link-local metadata or
 IPv6 destinations. Host execution keeps the host proxy's address policy.
+`PVISOR_DIAG_COMMIT=1` logs compressed RAM generation publication diagnostics:
+logical length, dirty block count, explicit zero override bytes, generation
+capture time (including generation publication), and total store commit time.
+Counters describe logical staging state, not physical I/O. This opt-in path
+preserves publication and failure ordering; compare identical builds/settings.
+
+Compressed managed backing preserves complete explicit zero overrides as
+metadata during generation capture, reusing the canonical zero checksum by
+actual block length. Equal parent blocks are skipped; nonzero ancestors receive
+an explicit zero entry. Partial zero masks and later partial writes still use
+normal reconstruction. Compaction, content IDs, synchronization and failure
+fencing retain the existing contract.
+
+
+### Committed compressed RAM cache reclamation
+
+On Linux, writable compressed RAM commits advise `POSIX_FADV_DONTNEED` on
+all immutable generation descriptors after successful durable publication.
+This releases compressed output and ancestor cache that could otherwise consume
+the measured node budget while guests are offloaded. Compaction also advises
+old ancestors retained by pins. A commit with no dirty blocks advises its
+existing chain after syncing the manifest, covering cache refilled by restore.
+Read-only inspectors and other platforms retain their existing behavior.
+
+This policy is independent of the experimental staging-cache setting below.
+It changes no data, generation ownership, pins, format, durability ordering or
+scheduler reservations. Advice failures warn without failing a durable commit.
+Reclamation is advisory, not a guaranteed memory cap: concurrent reads can refill
+cache, and publication can still have a transient output-cache peak. Subsequent
+restores may require more disk reads. High-density VM performance remains a
+separate acceptance gate; this policy does not establish UKSM/offload benefits.
+
+### Experimental compressed staging cache control
+
+`PVISOR_EXPERIMENTAL_STAGING_CACHE=1` enables a Linux-only experiment for each
+new compressed RAM writer. Unset or `0` preserves existing behavior. Other
+values are rejected; enabling it on other platforms returns Unsupported.
+The setting is read once at writer creation, does not toggle UKSM/offload,
+and does not change snapshot format or immutable read-only inspectors.
+
+A private worker performs staging `sync_data` and `POSIX_FADV_DONTNEED` after
+16 MiB of staged writes. Each writer has a 32 MiB unacknowledged-write budget;
+new writes wait when that budget is exhausted. Partial-page writes count the
+whole staged page span. Overwrites consume new credits, and an older completion
+never acknowledges a newer write. Errors stop the worker and fail subsequent
+write/drain operations. Publication drains the worker before capture/truncation;
+destruction drains remaining work and joins before the staging file is removed.
+Read/flush calls remain serialized by the existing store owner; worker advice
+can overlap them but never modifies bytes or dirty/zero masks.
+
+Read paths advise fully covered pages after copying their data: at most 16 MiB
+per read-at batch, or one reconstructed block. This includes publication reads;
+partial page edges are retained. Reads may refill cache and dirty pages may
+remain despite advice. This is a per-writer write budget, **not** a physical
+cache cap, node-wide budget, pressure detector, or automatic policy. It can add
+I/O, backpressure and cold-read latency. Keep it opt-in until real FUSE/VM
+correctness, shutdown and high-density throughput/tail-latency comparisons pass.
+
+### Shared-pool publication diagnostics
+
+With `PVISOR_EXPERIMENTAL_MEMORY_METRICS` set on the pool server, each connection
+reports cumulative publication counts on STATS requests at most once per second
+and once before disconnect cleanup. Records distinguish no cross-session
+duplicate yet, object-slot capacity, pool-lock contention, reference budget,
+and other rejection. Classification uses local typed failures, not matching
+error text; existing wire replies and client behavior are unchanged.
+`accepted_total` counts pool publication, not committed VM mappings or physical
+savings. `processing_us_total` covers pool intern calls, excluding socket I/O,
+client barriers and early reference-budget rejection. `elapsed_us` is local
+monotonic connection time; session UUID and PID identify the stream.
+Diagnostics never relax admission, byte comparison or slot ownership.
+
+Diagnostic `unix_us` provides a wall-clock sample for phase alignment; use local
+`elapsed_us` for durations because the wall clock can be adjusted.

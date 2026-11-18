@@ -311,6 +311,23 @@ pub struct SnapshotChain {
 }
 
 impl SnapshotChain {
+    // The writer calls this only after durable publication. Advise existing
+    // descriptors, never reopen paths or change ownership/pins. This is a hint:
+    // readers can refill pages and failures must not invalidate a durable head.
+    pub(super) fn advise_cold(&self) {
+        #[cfg(target_os = "linux")]
+        for layer in &self.layers {
+            use std::os::fd::AsRawFd;
+            let result = unsafe {
+                libc::posix_fadvise(layer.file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED)
+            };
+            if result != 0 {
+                tracing::warn!(error = %io::Error::from_raw_os_error(result),
+                    "compressed RAM generation cache advice failed");
+            }
+        }
+    }
+
     pub fn open(directory: &Path, head: ImageId) -> io::Result<Self> {
         let mut layers = Vec::new();
         let mut seen = BTreeSet::new();
@@ -425,19 +442,44 @@ impl SnapshotChain {
         dirty: &BTreeSet<u64>,
         read: impl FnMut(u64, &mut [u8]) -> io::Result<()>,
     ) -> io::Result<Self> {
-        Self::capture_inner(directory, layout, parent, dirty, false, read)
+        Self::capture_inner(directory, layout, parent, dirty, (false, None), read)
     }
 
     /// Capture newly zero-initialized storage. `written` must contain every block
     /// ever written, even if written back to zero. The caller must flush mmap
     /// writes and provide a stable epoch. No parent/compaction can use this path.
+    #[cfg(test)]
     pub(super) fn capture_zero_base(
         directory: &Path,
         layout: &RamLayout,
         written: &BTreeSet<u64>,
         read: impl FnMut(u64, &mut [u8]) -> io::Result<()>,
     ) -> io::Result<Self> {
-        Self::capture_inner(directory, layout, None, written, true, read)
+        Self::capture_inner(directory, layout, None, written, (true, None), read)
+    }
+
+    /// Internal staging contract: each zero block is dirty and completely
+    /// covered by authoritative zero overrides, including its short tail.
+    /// Partial overrides must use the reader. Publication order is unchanged.
+    pub(super) fn capture_staged(
+        directory: &Path,
+        layout: &RamLayout,
+        parent: Option<&Self>,
+        dirty: &BTreeSet<u64>,
+        zeros: &BTreeSet<u64>,
+        read: impl FnMut(u64, &mut [u8]) -> io::Result<()>,
+    ) -> io::Result<Self> {
+        if !zeros.is_subset(dirty) {
+            return Err(invalid("zero proof must be a subset of dirty blocks"));
+        }
+        Self::capture_inner(
+            directory,
+            layout,
+            parent,
+            dirty,
+            (parent.is_none(), Some(zeros)),
+            read,
+        )
     }
 
     fn capture_inner(
@@ -445,9 +487,10 @@ impl SnapshotChain {
         layout: &RamLayout,
         parent: Option<&Self>,
         dirty: &BTreeSet<u64>,
-        zero_base: bool,
+        zero_proof: (bool, Option<&BTreeSet<u64>>),
         mut read: impl FnMut(u64, &mut [u8]) -> io::Result<()>,
     ) -> io::Result<Self> {
+        let (zero_base, explicit_zeros) = zero_proof;
         layout.validate()?;
         let directory = directory.canonicalize()?;
         if parent.is_some_and(|chain| chain.layout() != layout || chain.directory != directory)
@@ -475,21 +518,47 @@ impl SnapshotChain {
         let mut sizes = Vec::new();
         let mut payload_bytes = 0;
         let mut zero_checksums = std::collections::BTreeMap::new();
+        let mut inherited_fill_checksums = BTreeMap::new();
         for block in blocks {
             let (_, length) = layout.block_span(block)?;
-            if zero_base && !dirty.contains(&block) {
+            if (zero_base && !dirty.contains(&block))
+                || explicit_zeros.is_some_and(|zeros| zeros.contains(&block))
+            {
                 // Preserve the complete base index and its content identity, but
-                // never materialize or scan an unwritten block more than once
+                // never materialize or scan a proven zero block more than once
                 // per length (including short region tails).
                 let checksum = *zero_checksums
                     .entry(length)
                     .or_insert_with(|| hash(&vec![0; length]));
+                if delta.is_some_and(|chain| chain.resolved[&block].1.checksum == checksum) {
+                    continue;
+                }
                 entries.push(Entry {
                     block,
                     frame: None,
                     fill: Some(0),
                     checksum,
                 });
+                continue;
+            }
+            if delta.is_none()
+                && !dirty.contains(&block)
+                && let Some(parent) = parent
+                && let Some(fill) = parent.resolved[&block].1.fill
+            {
+                // Compaction still publishes an independent full base. The dirty
+                // contract makes an unchanged immutable fill authoritative; do not
+                // materialize/hash every zero page again. Validate its checksum
+                // once per (length, byte), including short region tails, and check
+                // every inherited descriptor against that value before reuse.
+                let entry = &parent.resolved[&block].1;
+                let checksum = *inherited_fill_checksums
+                    .entry((length, fill))
+                    .or_insert_with(|| hash(&vec![fill; length]));
+                if checksum != entry.checksum {
+                    return Err(invalid("RAM block checksum mismatch"));
+                }
+                entries.push(entry.clone());
                 continue;
             }
             let mut data = vec![0; length];
@@ -678,6 +747,75 @@ mod tests {
         )
         .unwrap()
     }
+    #[test]
+    fn staged_zero_proofs_match_generic_across_tails_deltas_and_compaction() {
+        let fast_dir = tempfile::tempdir().unwrap();
+        let plain_dir = tempfile::tempdir().unwrap();
+        let l = layout();
+        let dirty = (0..l.block_count()).collect::<BTreeSet<_>>();
+        let mut fast: Option<SnapshotChain> = None;
+        let mut plain: Option<SnapshotChain> = None;
+        for round in 0..12u8 {
+            let mut data = vec![round + 1; l.logical_bytes() as usize];
+            let mut zeros = BTreeSet::new();
+            if round > 0 {
+                for block in [0, l.block_count() - 1] {
+                    let (offset, len) = l.block_span(block).unwrap();
+                    data[offset as usize..offset as usize + len].fill(0);
+                    zeros.insert(block);
+                }
+            }
+            let next = SnapshotChain::capture_staged(
+                fast_dir.path(),
+                &l,
+                fast.as_ref(),
+                &dirty,
+                &zeros,
+                |block, out| {
+                    assert!(!zeros.contains(&block), "proven zero must not be read");
+                    let offset = l.block_span(block)?.0 as usize;
+                    out.copy_from_slice(&data[offset..offset + out.len()]);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let generic = capture(
+                plain_dir.path(),
+                plain.as_ref(),
+                &dirty.iter().copied().collect::<Vec<_>>(),
+                &data,
+            );
+            assert_eq!(next.head_id(), generic.head_id());
+            let output = tempfile::tempfile().unwrap();
+            SnapshotChain::open(fast_dir.path(), next.head_id())
+                .unwrap()
+                .restore_to(&output)
+                .unwrap();
+            let mut restored = vec![0; data.len()];
+            output.read_exact_at(&mut restored, 0).unwrap();
+            assert_eq!(restored, data);
+            fast = Some(next);
+            plain = Some(generic);
+        }
+    }
+
+    #[test]
+    fn staged_zero_proof_outside_dirty_is_rejected_before_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            SnapshotChain::capture_staged(
+                dir.path(),
+                &layout(),
+                None,
+                &BTreeSet::new(),
+                &BTreeSet::from([0]),
+                |_, _| panic!("invalid proof must not read")
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
     #[test]
     fn zero_base_skips_unwritten_blocks_and_matches_generic_identity() {
         for written in [BTreeSet::new(), BTreeSet::from([0, 1])] {
@@ -1007,5 +1145,187 @@ mod tests {
         assert!(result.is_err());
         assert!(chain.read_block(0).is_err());
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+    fn fill_compaction_fixture() -> (tempfile::TempDir, RamLayout, Vec<u8>, SnapshotChain) {
+        let root = tempfile::tempdir().unwrap();
+        let l = RamLayout {
+            page_bytes: 4096,
+            regions: vec![
+                RamRegion {
+                    guest_address: 0,
+                    length: (3 * BLOCK_BYTES + 7) as u64,
+                },
+                RamRegion {
+                    guest_address: 1 << 32,
+                    length: BLOCK_BYTES as u64,
+                },
+            ],
+        };
+        let mut data = vec![0; l.logical_bytes() as usize];
+        data[BLOCK_BYTES..2 * BLOCK_BYTES].fill(7);
+        data[2 * BLOCK_BYTES] = 19; // clean, non-fill frame must still use the reader
+        data[3 * BLOCK_BYTES..3 * BLOCK_BYTES + 7].fill(9);
+        let mut chain = None;
+        for round in 0..COMPACT_DEPTH {
+            data[3 * BLOCK_BYTES + 7] = round as u8 + 1;
+            let dirty = if round == 0 {
+                (0..l.block_count()).collect()
+            } else {
+                [4].into()
+            };
+            chain = Some(
+                SnapshotChain::capture(root.path(), &l, chain.as_ref(), &dirty, |block, out| {
+                    let offset = l.block_span(block)?.0 as usize;
+                    out.copy_from_slice(&data[offset..offset + out.len()]);
+                    Ok(())
+                })
+                .unwrap(),
+            );
+        }
+        (root, l, data, chain.unwrap())
+    }
+
+    #[test]
+    fn compaction_reuses_only_clean_validated_fills_and_preserves_full_base_identity() {
+        let (root, l, mut data, parent) = fill_compaction_fixture();
+        assert_eq!(parent.depth(), COMPACT_DEPTH);
+        data[BLOCK_BYTES..2 * BLOCK_BYTES].fill(0); // dirty nonzero -> explicit zero
+        data[3 * BLOCK_BYTES + 7] = 42;
+        let mut reads = Vec::new();
+        let next = SnapshotChain::capture_staged(
+            root.path(),
+            &l,
+            Some(&parent),
+            &[1, 4].into(),
+            &[1].into(),
+            |block, out| {
+                reads.push(block);
+                let offset = l.block_span(block)?.0 as usize;
+                out.copy_from_slice(&data[offset..offset + out.len()]);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(reads, vec![2, 4]); // no full read of clean zero/nonzero short fills
+        assert_eq!(next.depth(), 1);
+        let reference = tempfile::tempdir().unwrap();
+        let baseline = SnapshotChain::capture(
+            reference.path(),
+            &l,
+            None,
+            &(0..l.block_count()).collect(),
+            |block, out| {
+                let offset = l.block_span(block)?.0 as usize;
+                out.copy_from_slice(&data[offset..offset + out.len()]);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(next.head_id(), baseline.head_id());
+        let restored = tempfile::tempfile().unwrap();
+        SnapshotChain::open(root.path(), next.head_id())
+            .unwrap()
+            .restore_to(&restored)
+            .unwrap();
+        let mut bytes = vec![0; data.len()];
+        restored.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, data);
+        assert_eq!(parent.read_block(1).unwrap(), vec![7; BLOCK_BYTES]);
+    }
+
+    #[test]
+    fn compaction_rejects_invalid_inherited_fill_checksum() {
+        let (root, l, data, mut parent) = fill_compaction_fixture();
+        parent.resolved.get_mut(&0).unwrap().1.checksum[0] ^= 1;
+        let error =
+            SnapshotChain::capture(root.path(), &l, Some(&parent), &[4].into(), |block, out| {
+                let offset = l.block_span(block)?.0 as usize;
+                out.copy_from_slice(&data[offset..offset + out.len()]);
+                Ok(())
+            })
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("checksum mismatch"));
+        assert_eq!(parent.depth(), COMPACT_DEPTH);
+    }
+
+    #[test]
+    #[ignore = "512 MiB logical compaction A/B; explicit engineering probe, no VM"]
+    fn sparse_compaction_mechanism_probe() {
+        let mib = 1024 * 1024;
+        let l = RamLayout {
+            page_bytes: 4096,
+            regions: vec![RamRegion {
+                guest_address: 0,
+                length: 512 * mib,
+            }],
+        };
+        let root = tempfile::tempdir().unwrap();
+        let mut parent =
+            SnapshotChain::capture_zero_base(root.path(), &l, &BTreeSet::new(), |_, _| {
+                panic!("zero base read")
+            })
+            .unwrap();
+        let dirty = (0..64).collect::<BTreeSet<_>>(); // 4 MiB changes, 508 MiB clean fills
+        for round in 1..COMPACT_DEPTH {
+            parent = SnapshotChain::capture_staged(
+                root.path(),
+                &l,
+                Some(&parent),
+                &dirty,
+                &BTreeSet::new(),
+                |block, out| {
+                    out.fill(0);
+                    out[..8].copy_from_slice(&((round as u64) * 1000 + block).to_le_bytes());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(parent.depth(), COMPACT_DEPTH);
+        let mut heads = Vec::new();
+        for reference in [true, false] {
+            // Separate immutable namespaces avoid AlreadyExists verification work
+            // from contaminating the timing. Both paths see identical ancestors.
+            let dest = tempfile::tempdir().unwrap();
+            for item in std::fs::read_dir(root.path()).unwrap() {
+                let item = item.unwrap();
+                std::fs::hard_link(item.path(), dest.path().join(item.file_name())).unwrap();
+            }
+            let chain = SnapshotChain::open(dest.path(), parent.head_id()).unwrap();
+            let selection = if reference {
+                (0..l.block_count()).collect()
+            } else {
+                dirty.clone()
+            };
+            let start = std::time::Instant::now();
+            let mut reads = 0u64;
+            let next = SnapshotChain::capture_staged(
+                dest.path(),
+                &l,
+                Some(&chain),
+                &selection,
+                &BTreeSet::new(),
+                |block, out| {
+                    reads += 1;
+                    out.fill(0);
+                    if block < 64 {
+                        out[..8].copy_from_slice(&(8000 + block).to_le_bytes());
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            eprintln!(
+                "compaction-probe {}",
+                serde_json::json!({"reference_full_materialization":reference,"logical_bytes":l.logical_bytes(),"dirty_bytes":4*mib,"reader_blocks":reads,"capture_us":start.elapsed().as_micros(),"depth":next.depth()})
+            );
+            assert_eq!(next.depth(), 1);
+            assert_eq!(reads, if reference { l.block_count() } else { 64 });
+            heads.push(next.head_id());
+            assert_eq!(next.read_block(100).unwrap(), vec![0; BLOCK_BYTES]);
+            assert_eq!(&next.read_block(0).unwrap()[..8], &8000u64.to_le_bytes());
+        }
+        assert_eq!(heads[0], heads[1]);
     }
 }

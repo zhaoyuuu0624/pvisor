@@ -2039,6 +2039,37 @@ node-owned views, compressed snapshots and other platforms retain their previous
 path. This optimization does not enable offload on restored COW memory and does
 not promise a measured total-memory saving before workload validation.
 
+## Experimental shared backing offload
+
+The experimental ordinary OCI adapter selects `ColdRamOptions.shared_backing`
+with an explicitly negotiated physical `memory_pool`. The profile keeps the VM-owned live backing, including
+FUSE `ram_compression`. It does not enable KSM, UFFD compression, snapshot
+restoration or change scan/admission/reclaim policies. Default remains off.
+
+The sharing worker tracks replaced pages independently of pool references.
+Under the existing CPU/device transition barrier, offload invalidates old
+publication generations, checks live replaced pages and preserves nonzero COW
+bytes at their original backing offsets. Consecutive verified zero pages use
+aligned Linux hole punching and one MAP_SHARED remap per run (at most 16 MiB),
+instead of materializing zero payloads. Free-page reports alone are not proof
+of current zero content: reused guest pages are checked under the same barrier.
+The RAM FUSE adapter drains/invalidates the logical inode through Linux's punch
+operation and records explicit zero overrides in its store; it does not punch
+immutable generation files. Unsupported hole punching falls back to bounded
+zero writes; other errors remain fail-stop with pending mappings/pins retained.
+Existing native reclaim and host publication still follow reattachment.
+Metrics distinguish logical bytes, copied bytes and sparse-zero bytes, not
+physical SSD traffic. The scratch copy is bounded; per-page ownership metadata and deferred
+references are charged to the VM. Detached pins are released outside VM locks.
+The host still commits compressed generations before reporting success.
+Mapping, writeback or commit failure follows fail-stop; API deletion alone is
+not proof of physical cleanup. This is an experimental correctness path, not a
+claim of performance benefit or completed rollout qualification.
+
+Guest-idle automatic reclaim remains incompatible with cold pagers. This
+integration enables externally managed reclaim only; it does not change the
+existing automatic idle policy or vCPU control protocol.
+
 ## Shared CLI VM contracts and Windows directory rename
 
 Windows directory rename updates cached paths for the directory and all
@@ -2098,3 +2129,42 @@ namespace admission through opacity/identity publication; fresh directories keep
 disjoint-parent creation concurrency. Native security contexts, guest ownership,
 umask and setgid handling stay in the adapter. No guest entry is published by the
 creating request until Core completes directory initialization.
+Managed shared-backing reattachment batches consecutive nonzero replaced pages
+into at most 16 MiB per write/remap, within one RAM region. Zero pages and
+untracked gaps end each batch. A reusable staging buffer preserves the existing
+write-before-remap and pin-retirement ordering; errors remain fatal. Optional
+`PVISOR_EXPERIMENTAL_MEMORY_METRICS` diagnostics include `copied_runs` and
+`remap_runs` (logical batches, not physical SSD writes or short-write retries).
+
+`PVISOR_DIAG_SHARED_REATTACH=1` performs an opt-in content census under the
+transition barrier before reattachment: live zero, nonzero equal/different to
+a pinned pool object, nonzero without a pin, and unknown. It does not prove
+physical sharing or dirty history and never changes mapping authority. Failed
+reference reads are reported as unknown. Diagnostic reads can fault pages in
+and extend the real pause; `diagnostic_us` is separate from reattachment time.
+Use separate diagnostic runs, never treat these as uninstrumented latency data.
+
+Reattachment metrics also split `classify_us` (live-byte checks, run discovery
+and staging copies), `backing_us` (zero/pwrite), `remap_us` (mmap), and
+`retire_us` (reference retirement and tracked-page removal). Timers are enabled
+only with `PVISOR_EXPERIMENTAL_MEMORY_METRICS`; they cover successful runs,
+exclude the optional content census, and do not include later offload commit.
+The sum can be slightly below `elapsed_us` because loop overhead and per-run
+microsecond rounding are excluded. These timings do not identify cache ownership.
+
+### Linux cold-pager diagnostic cadence
+
+With memory metrics enabled, Linux cold-pager full page-state censuses and
+reporting STATS RPCs run at most once per second, plus one final report. Scan
+quotas, barriers, reference retirement and empty-scan health/flush calls are
+unchanged. `elapsed_us` is monotonic time since this worker started;
+`batches_total` and `snapshots_total` include batches between reports.
+`snapshots_batch` describes only the reported batch (zero on final reporting),
+so sparse reports must not be summed to reconstruct submitted pages.
+For same-binary engineering A/B only, host
+`PVISOR_DIAG_COLD_METRICS_EVERY_BATCH=1` restores per-batch reporting; other
+values use the one-second cadence. This has no effect unless metrics are enabled.
+A reporting interval is not a bound on scanning CPU or a claim of net RAM savings.
+
+Diagnostic `unix_us` provides a wall-clock sample for phase alignment; use local
+`elapsed_us` for durations because the wall clock can be adjusted.

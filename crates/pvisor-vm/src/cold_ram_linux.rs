@@ -21,6 +21,86 @@ use crate::cold_ram_scan::{self as scan, deadline, quiesce_nonempty};
 
 const BLOCK: usize = 64 * 1024;
 const BATCH_BYTES: usize = 4 * 1024 * 1024;
+// Diagnostic throttling never gates scan work, reference retirement or health checks.
+struct PagerMetrics {
+    started: Instant,
+    last: Option<Instant>,
+    every_batch: bool,
+    batches: u64,
+    snapshots: u64,
+}
+impl PagerMetrics {
+    fn new(every_batch: bool) -> Self {
+        Self {
+            started: Instant::now(),
+            last: None,
+            every_batch,
+            batches: 0,
+            snapshots: 0,
+        }
+    }
+    fn due(&self, now: Instant) -> bool {
+        self.every_batch
+            || self
+                .last
+                .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1))
+    }
+    fn report<S: ColdRamStore>(
+        &mut self,
+        pager_state: &Mutex<Pager<S>>,
+        pool: &Mutex<S>,
+        snapshots_batch: usize,
+        final_report: bool,
+    ) {
+        // Pool RPCs never run with the pager or VM barrier held. Pool
+        // payload is global; references and cross-session objects are session-local.
+        // None of these counters measures VM physical savings.
+        let stats = pool
+            .lock()
+            .unwrap_or_else(|_| fatal("store poisoned"))
+            .stats()
+            .unwrap_or_else(|error| fatal(error));
+        let pager = pager_state
+            .lock()
+            .unwrap_or_else(|_| fatal("pager poisoned"));
+        let cold: u64 = pager
+            .pages
+            .iter()
+            .enumerate()
+            .filter(|(_, page)| page.cold.is_some())
+            .map(|(index, _)| pager.pages.range(index).len)
+            .sum();
+        eprintln!(
+            "pvisor-cold-linux cold_bytes_current={cold} discarded_bytes_total={} restored_bytes_total={} invalidated_total={} put_rejections_total={} restore_count_total={} restore_time_us_total={} restore_time_us_max={} snapshots_batch={} pool_encoded_bytes_current={} pool_objects_current={} pool_session_references_current={} pool_cross_session_objects_current={} elapsed_us={} unix_us={} batches_total={} snapshots_total={} final={} pid={}",
+            pager.discarded,
+            pager.restored,
+            pager.rejected,
+            pager.put_rejections,
+            pager.restore_count,
+            pager.restore_total_us,
+            pager.restore_max_us,
+            snapshots_batch,
+            stats.encoded_bytes,
+            stats.objects,
+            stats.session_references,
+            stats.cross_session_objects,
+            self.started.elapsed().as_micros(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros(),
+            self.batches,
+            self.snapshots,
+            u8::from(final_report),
+            std::process::id()
+        );
+        if let Some(scanner) = &pager.shared_scan {
+            scanner.report(pager.file_hint_candidates);
+        }
+        self.last = Some(Instant::now());
+    }
+}
+
 const PAGE_PRESENT: u8 = 1;
 const PAGE_FILE: u8 = 2;
 // Keep only these two state bits. PFNs and unrelated pagemap data never escape.
@@ -34,6 +114,40 @@ fn pagemap_flags(bits: u64) -> u8 {
     present | file
 }
 static PENDING: AtomicU64 = AtomicU64::new(0);
+
+// Only invoked with CPU/device writers stopped and the pager locked. PUNCH_HOLE
+// preserves file length and invalidates the Linux inode cache. Unsupported raw
+// filesystems keep the byte-copy behavior; genuine I/O failures stay fatal.
+fn zero_backing_range(file: &std::fs::File, offset: u64, length: usize) -> io::Result<bool> {
+    use std::os::unix::fs::FileExt;
+    let offset_i64: i64 = offset
+        .try_into()
+        .map_err(|_| io::Error::other("backing offset overflow"))?;
+    if unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            offset_i64,
+            length as i64,
+        )
+    } == 0
+    {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if !matches!(error.raw_os_error(), Some(libc::EOPNOTSUPP | libc::ENOSYS)) {
+        return Err(error);
+    }
+    let zeros = [0; 64 * 1024];
+    for start in (0..length).step_by(zeros.len()) {
+        file.write_all_at(
+            &zeros[..(length - start).min(zeros.len())],
+            offset + start as u64,
+        )?;
+    }
+    Ok(false)
+}
+
 const API: u64 = 0xaa;
 // Linux x86_64 _IOWR/_IOR ABI; this module is compiled only on that target.
 const fn iowr(number: u64, size: u64) -> libc::c_ulong {
@@ -310,6 +424,10 @@ struct Pager<S: ColdRamStore> {
     uffd: Option<Arc<Uffd>>,
     pagemap: Option<std::fs::File>,
     share_resident: bool,
+    shared_backing: bool,
+    replaced: std::collections::BTreeSet<usize>,
+    generation: u64,
+    retired: Vec<S::Object>,
     shared_scan: Option<scan::Scanner>,
     read_hints: Option<Arc<ReadHints>>,
     file_hint_candidates: u64,
@@ -352,6 +470,7 @@ fn host_sorted_pages<O>(mappings: &[Range], eligible_at: Instant, block_bytes: u
 }
 
 struct Snapshot {
+    generation: u64,
     index: usize,
     bytes: Vec<u8>,
 }
@@ -396,10 +515,19 @@ fn ranges(memory: &GuestMemoryMmap, device_start: u64) -> io::Result<Vec<Range>>
     ranges_excluding_kernel(memory, device_start, None)
 }
 
+#[cfg(test)]
 fn ranges_excluding_kernel(
     memory: &GuestMemoryMmap,
     device_start: u64,
     kernel: Option<crate::vmm::RawKernelMapping>,
+) -> io::Result<Vec<Range>> {
+    ranges_for_profile(memory, device_start, kernel, false)
+}
+fn ranges_for_profile(
+    memory: &GuestMemoryMmap,
+    device_start: u64,
+    kernel: Option<crate::vmm::RawKernelMapping>,
+    shared_backing: bool,
 ) -> io::Result<Vec<Range>> {
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page != 4096 {
@@ -433,10 +561,18 @@ fn ranges_excluding_kernel(
         {
             continue; // Device/DAX windows are never pager candidates.
         }
-        if region.file_offset().is_some()
-            || region.flags() & (libc::MAP_SHARED | libc::MAP_HUGETLB) != 0
-            || region.flags() & (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS)
-                != libc::MAP_PRIVATE | libc::MAP_ANONYMOUS
+        let mapping_ok = if shared_backing {
+            region.file_offset().is_some()
+                && region.flags() & libc::MAP_SHARED != 0
+                && region.flags() & (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB)
+                    == 0
+        } else {
+            region.file_offset().is_none()
+                && region.flags() & (libc::MAP_SHARED | libc::MAP_HUGETLB) == 0
+                && region.flags() & (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS)
+                    == libc::MAP_PRIVATE | libc::MAP_ANONYMOUS
+        };
+        if !mapping_ok
             || region.prot() & (libc::PROT_READ | libc::PROT_WRITE)
                 != libc::PROT_READ | libc::PROT_WRITE
             || !(region.as_ptr() as usize).is_multiple_of(page as usize)
@@ -444,7 +580,11 @@ fn ranges_excluding_kernel(
         {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "Linux cold RAM requires private anonymous writable ordinary RAM; file-backed/COW/shared/hugetlb RAM is unsupported",
+                if shared_backing {
+                    "shared backing requires writable ordinary MAP_SHARED file RAM; private/COW/anonymous/hugetlb RAM is unsupported"
+                } else {
+                    "Linux cold RAM requires private anonymous writable ordinary RAM; file-backed/COW/shared/hugetlb RAM is unsupported"
+                },
             ));
         }
         result.push(Range {
@@ -478,7 +618,8 @@ fn publish_snapshot<S: ColdRamStore>(
         let mut state = pager
             .lock()
             .map_err(|_| io::Error::other("pager poisoned"))?;
-        if state.share_resident
+        if state.generation == snapshot.generation
+            && state.share_resident
             && state.page_flags(state.pages.range(snapshot.index))? == PAGE_PRESENT
         {
             let retired = state.pages[snapshot.index].cold.take().map(|cold| *cold);
@@ -586,6 +727,9 @@ impl<S: ColdRamStore> Pager<S> {
                 return Err(io::Error::last_os_error());
             }
             for index in first..=last {
+                if self.shared_backing {
+                    self.replaced.insert(index);
+                }
                 if let Some(object) = self.pages[index].cold.take() {
                     retired.push(*object);
                     self.shared_scan.as_mut().unwrap().invalidated(index);
@@ -773,11 +917,18 @@ impl<S: ColdRamStore> Pager<S> {
             if let Some(scanner) = &mut self.shared_scan {
                 scanner.sampled(index);
             }
-            batch.0.push(Snapshot { index, bytes });
+            batch.0.push(Snapshot {
+                generation: self.generation,
+                index,
+                bytes,
+            });
         }
         batch
     }
     fn commit(&mut self, snapshot: &Snapshot, object: S::Object) -> io::Result<Option<S::Object>> {
+        if snapshot.generation != self.generation {
+            return Ok(Some(object));
+        }
         let range = self.pages.range(snapshot.index);
         let page = &mut self.pages[snapshot.index];
         if page.cold.is_some() && !self.share_resident {
@@ -826,6 +977,9 @@ impl<S: ColdRamStore> Pager<S> {
             // CPU/device access is drained, bytes were rechecked, and the pool
             // reference pins this slot. Linux invalidates KVM secondary mappings
             // on MAP_FIXED; reads retain the pool page and writes create COW RAM.
+            if self.shared_backing {
+                self.replaced.insert(snapshot.index);
+            }
             let mapped = unsafe {
                 libc::mmap(
                     range.start as *mut libc::c_void,
@@ -931,6 +1085,207 @@ impl<S: ColdRamStore> Pager<S> {
             self.restore(index)
         }
     }
+    // Diagnostic only: content equality is not proof that a page is physically
+    // shared or never written. Called under the existing CPU/device barrier.
+    fn diagnose_reattach(&self) -> serde_json::Value {
+        use std::os::unix::fs::FileExt;
+        let start = Instant::now();
+        let mut zero = 0u64;
+        let mut same = 0u64;
+        let mut different = 0u64;
+        let mut unpinned = 0u64;
+        let mut unknown = 0u64;
+        let mut reference = [0u8; 4096];
+        for &index in &self.replaced {
+            let range = self.pages.range(index);
+            if range.len != 4096 {
+                unknown += range.len;
+                continue;
+            }
+            let live = unsafe { std::slice::from_raw_parts(range.start as *const u8, 4096) };
+            if live.iter().all(|&b| b == 0) {
+                zero += 4096;
+                continue;
+            }
+            let Some(object) = &self.pages[index].cold else {
+                unpinned += 4096;
+                continue;
+            };
+            let mapping = self
+                .store
+                .lock()
+                .ok()
+                .and_then(|s| s.shared_mapping(object));
+            match mapping {
+                Some(mapping)
+                    if mapping
+                        .file
+                        .read_exact_at(&mut reference, mapping.offset)
+                        .is_ok() =>
+                {
+                    if live == reference {
+                        same += 4096;
+                    } else {
+                        different += 4096;
+                    }
+                }
+                _ => unknown += 4096,
+            }
+        }
+        serde_json::json!({"generation":self.generation,"tracked_bytes":self.replaced.len() * 4096,
+            "live_zero_bytes":zero,"nonzero_equal_pinned_bytes":same,
+            "nonzero_different_pinned_bytes":different,"nonzero_without_pin_bytes":unpinned,
+            "unknown_bytes":unknown,"diagnostic_us":start.elapsed().as_micros(),
+            "content_only_not_physical_sharing":true})
+    }
+
+    fn reattach_backing(&mut self) -> io::Result<()> {
+        use std::os::{fd::AsRawFd, unix::fs::FileExt};
+        if !self.shared_backing {
+            return Err(io::Error::other("not a shared backing pager"));
+        }
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("sharing generation exhausted"))?;
+        if std::env::var("PVISOR_DIAG_SHARED_REATTACH").as_deref() == Ok("1") {
+            eprintln!(
+                "pvisor-shared-reattach-classification {}",
+                self.diagnose_reattach()
+            );
+        }
+        let started = std::time::Instant::now();
+        let metrics = std::env::var_os("PVISOR_EXPERIMENTAL_MEMORY_METRICS").is_some();
+        let mut classify_us = 0;
+        let mut backing_us = 0;
+        let mut remap_us = 0;
+        let mut retire_us = 0;
+        let pages = self.replaced.len();
+        let mut sparse_zero_bytes = 0;
+        let mut copied_bytes = 0;
+        let mut copied_runs = 0;
+        let mut remap_runs = 0;
+        // Reuse bounded staging storage; never pass live guest mappings to writeback.
+        let mut copy_buffer = Vec::new();
+        while let Some(&index) = self.replaced.first() {
+            let classify_started = metrics.then(Instant::now);
+            let range = self.pages.range(index);
+            let region = self
+                .memory
+                .iter()
+                .find(|r| {
+                    range.start >= r.as_ptr() as u64
+                        && range.start + range.len <= r.as_ptr() as u64 + r.len()
+                })
+                .ok_or_else(|| io::Error::other("shared backing geometry lost"))?;
+            let backing = region
+                .file_offset()
+                .ok_or_else(|| io::Error::other("shared backing identity lost"))?;
+            let offset = backing
+                .start()
+                .checked_add(range.start - region.as_ptr() as u64)
+                .ok_or_else(|| io::Error::other("backing offset overflow"))?;
+            let mut bytes = [0u8; 4096];
+            if range.len != 4096 {
+                return Err(io::Error::other("shared backing page size"));
+            }
+            // Caller holds the transition lock, stopped CPUs and drained device leases.
+            bytes.copy_from_slice(unsafe {
+                std::slice::from_raw_parts(range.start as *const u8, 4096)
+            });
+            let mut count = 1;
+            if bytes == [0; 4096] {
+                // Verify live bytes, never infer zero from a retired pool pin or
+                // a previous free-page report: the guest may have reused it.
+                // Bound each range to 16 MiB and one backing region.
+                while count < 4096 && self.replaced.contains(&(index + count)) {
+                    let next = self.pages.range(index + count);
+                    if next.start != range.start + (count * 4096) as u64
+                        || next.len != 4096
+                        || next.start + next.len > region.as_ptr() as u64 + region.len()
+                    {
+                        break;
+                    }
+                    let live = unsafe { std::slice::from_raw_parts(next.start as *const u8, 4096) };
+                    if live != [0; 4096] {
+                        break;
+                    }
+                    count += 1;
+                }
+                classify_us += classify_started.map_or(0, |t| t.elapsed().as_micros());
+                let backing_started = metrics.then(Instant::now);
+                if zero_backing_range(backing.file(), offset, count * 4096)? {
+                    sparse_zero_bytes += count * 4096;
+                } else {
+                    copied_bytes += count * 4096;
+                }
+                backing_us += backing_started.map_or(0, |t| t.elapsed().as_micros());
+            } else {
+                copy_buffer.clear();
+                copy_buffer.extend_from_slice(&bytes);
+                // Preserve sparse-zero boundaries and never cross a region or
+                // an untracked page. The transition barrier keeps bytes stable.
+                while count < 4096 && self.replaced.contains(&(index + count)) {
+                    let next = self.pages.range(index + count);
+                    if next.start != range.start + (count * 4096) as u64
+                        || next.len != 4096
+                        || next.start + next.len > region.as_ptr() as u64 + region.len()
+                    {
+                        break;
+                    }
+                    let live = unsafe { std::slice::from_raw_parts(next.start as *const u8, 4096) };
+                    if live == [0; 4096] {
+                        break;
+                    }
+                    copy_buffer.extend_from_slice(live);
+                    count += 1;
+                }
+                // Do not replace mappings or retire pins until the entire run
+                // has been written successfully (including short-write retries).
+                classify_us += classify_started.map_or(0, |t| t.elapsed().as_micros());
+                let backing_started = metrics.then(Instant::now);
+                backing.file().write_all_at(&copy_buffer, offset)?;
+                backing_us += backing_started.map_or(0, |t| t.elapsed().as_micros());
+                copied_bytes += copy_buffer.len();
+                copied_runs += 1;
+            }
+            let remap_started = metrics.then(Instant::now);
+            let mapped = unsafe {
+                libc::mmap(
+                    range.start as *mut libc::c_void,
+                    count * 4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED | libc::MAP_FIXED,
+                    backing.file().as_raw_fd(),
+                    offset
+                        .try_into()
+                        .map_err(|_| io::Error::other("backing offset overflow"))?,
+                )
+            };
+            if mapped == libc::MAP_FAILED {
+                return Err(io::Error::last_os_error());
+            }
+            remap_us += remap_started.map_or(0, |t| t.elapsed().as_micros());
+            remap_runs += 1;
+            let retire_started = metrics.then(Instant::now);
+            for index in index..index + count {
+                if let Some(object) = self.pages[index].cold.take() {
+                    self.retired.push(*object);
+                }
+                self.replaced.remove(&index);
+            }
+            retire_us += retire_started.map_or(0, |t| t.elapsed().as_micros());
+        }
+        if metrics {
+            eprintln!(
+                "pvisor-shared-reattach pages={pages} logical_bytes={} elapsed_us={} copied_bytes={copied_bytes} sparse_zero_bytes={sparse_zero_bytes} copied_runs={copied_runs} remap_runs={remap_runs} classify_us={classify_us} backing_us={backing_us} remap_us={remap_us} retire_us={retire_us}",
+                pages * 4096,
+                started.elapsed().as_micros()
+            );
+        }
+        Ok(())
+    }
+
     fn shutdown(&mut self) -> io::Result<()> {
         // Shared mappings may still be borrowed by draining devices. Leave them
         // intact; closing this store pins server references until process exit.
@@ -973,14 +1328,14 @@ pub(crate) fn start<S: ColdRamStore + 'static>(
     store: S,
     options: ColdRamOptions,
 ) -> io::Result<()> {
+    if options.shared_backing && !(options.page_granular && options.share_resident) {
+        return Err(io::Error::other("shared backing requires physical sharing"));
+    }
     let block_bytes = if options.page_granular { 4096 } else { BLOCK };
     if options.share_resident && !options.page_granular {
         return Err(io::Error::other("shared RAM requires 4 KiB pages"));
     }
-    if cfg!(any(
-        feature = "tee",
-        feature = "aws-nitro"
-    )) {
+    if cfg!(any(feature = "tee", feature = "aws-nitro")) {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "Linux cold RAM unavailable with unguarded devices or confidential RAM",
@@ -1006,7 +1361,8 @@ pub(crate) fn start<S: ColdRamStore + 'static>(
         let locked = vmm
             .lock()
             .map_err(|_| io::Error::other("VMM lock poisoned"))?;
-        if locked.has_compact_restore_ram() || locked.is_paused()
+        if locked.has_compact_restore_ram()
+            || locked.is_paused()
             || locked.device_memory_gate().has_prepare()
             || locked.device_memory_gate().has_dedup_advice()
         {
@@ -1016,7 +1372,12 @@ pub(crate) fn start<S: ColdRamStore + 'static>(
         }
         let memory = locked.guest_memory().clone();
         let kernel = locked.raw_kernel_mapping();
-        let mappings = ranges_excluding_kernel(&memory, locked.ram_device_window_start(), kernel)?;
+        let mappings = ranges_for_profile(
+            &memory,
+            locked.ram_device_window_start(),
+            kernel,
+            options.shared_backing,
+        )?;
         handle
             .cold_pager_started
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1083,6 +1444,10 @@ pub(crate) fn start<S: ColdRamStore + 'static>(
                 )
             })?;
         Ok::<_, io::Error>(Arc::new(Mutex::new(Pager {
+            shared_backing: options.shared_backing,
+            replaced: Default::default(),
+            generation: 0,
+            retired: Vec::new(),
             memory,
             shared_scan: options
                 .share_resident
@@ -1111,6 +1476,20 @@ pub(crate) fn start<S: ColdRamStore + 'static>(
             return Err(error);
         }
     };
+    if options.shared_backing {
+        let target = pager.clone();
+        *handle
+            .shared_backing_reclaim
+            .lock()
+            .map_err(|_| io::Error::other("shared backing hook poisoned"))? =
+            Some(Box::new(move || {
+                target
+                    .lock()
+                    .map_err(|_| "pager poisoned".to_owned())?
+                    .reattach_backing()
+                    .map_err(|e| e.to_string())
+            }));
+    }
     if options.metrics {
         let pager = pager.lock().unwrap();
         let pid = std::process::id();
@@ -1188,107 +1567,157 @@ pub(crate) fn start<S: ColdRamStore + 'static>(
         None
     };
     let reservation = handle.cold_pager_started.clone();
+    let reclaim_hook = handle.shared_backing_reclaim.clone();
     let worker_pager = pager.clone();
     let worker_stop = stop.clone();
-    let worker = std::thread::Builder::new().name("pvisor-cold-pager".into()).spawn(move || {
-        let pool = worker_pager.lock().unwrap().store.clone();
-        loop {
-            // A full adaptive scan round always yields, even when every region
-            // is productive. Empty/sparse rounds cannot spin at the 1 ms pace.
-            let delay = worker_pager.lock().unwrap_or_else(|_| fatal("pager poisoned"))
-                .shared_scan.as_ref().map_or(scan::REJECT_RETRY, scan::Scanner::delay);
-            std::thread::sleep(delay);
-            // Empty scans still need to observe VM teardown without a barrier.
-            if handle.vmm.upgrade().is_none() {
-                break;
-            }
-            if let Some(reports) = &free_reports {
-                if let Some(report) = reports.pending() {
-                    let freed = handle.ram_quiesced(|_| {
-                        worker_pager.lock().map_err(|_| "pager poisoned")?
-                            .release_free_pages(&report.ranges).map_err(|error| error.to_string())
-                    });
-                    match freed {
-                        Ok(Some(objects)) => {
-                            for object in objects {
-                                pool.lock().unwrap_or_else(|_| fatal("store poisoned"))
-                                    .release(object).unwrap_or_else(|error| fatal(error));
+    let worker = std::thread::Builder::new()
+        .name("pvisor-cold-pager".into())
+        .spawn(move || {
+            let pool = worker_pager.lock().unwrap().store.clone();
+            // Explicit diagnostic control for same-binary comparisons with the old cadence.
+            let every_batch = std::env::var_os("PVISOR_DIAG_COLD_METRICS_EVERY_BATCH")
+                .is_some_and(|value| value == "1");
+            let mut metrics = PagerMetrics::new(every_batch);
+            loop {
+                // A full adaptive scan round always yields, even when every region
+                // is productive. Empty/sparse rounds cannot spin at the 1 ms pace.
+                let delay = worker_pager
+                    .lock()
+                    .unwrap_or_else(|_| fatal("pager poisoned"))
+                    .shared_scan
+                    .as_ref()
+                    .map_or(scan::REJECT_RETRY, scan::Scanner::delay);
+                std::thread::sleep(delay);
+                // Release detached pool pins outside pager/VMM locks, including while offloaded.
+                let retired = std::mem::take(
+                    &mut worker_pager
+                        .lock()
+                        .unwrap_or_else(|_| fatal("pager poisoned"))
+                        .retired,
+                );
+                for object in retired {
+                    pool.lock()
+                        .unwrap_or_else(|_| fatal("store poisoned"))
+                        .release(object)
+                        .unwrap_or_else(|e| fatal(e));
+                }
+                // Empty scans still need to observe VM teardown without a barrier.
+                if handle.vmm.upgrade().is_none() {
+                    break;
+                }
+                if let Some(reports) = &free_reports {
+                    if let Some(report) = reports.pending() {
+                        let freed = handle.ram_quiesced(|_| {
+                            worker_pager
+                                .lock()
+                                .map_err(|_| "pager poisoned")?
+                                .release_free_pages(&report.ranges)
+                                .map_err(|error| error.to_string())
+                        });
+                        match freed {
+                            Ok(Some(objects)) => {
+                                for object in objects {
+                                    pool.lock()
+                                        .unwrap_or_else(|_| fatal("store poisoned"))
+                                        .release(object)
+                                        .unwrap_or_else(|error| fatal(error));
+                                }
+                                reports
+                                    .complete(&report)
+                                    .unwrap_or_else(|error| fatal(error));
                             }
-                            reports.complete(&report).unwrap_or_else(|error| fatal(error));
+                            Ok(None) => continue,
+                            Err(error) if error == "VMM has stopped" => break,
+                            Err(error) => fatal(error),
                         }
-                        Ok(None) => continue,
-                        Err(error) if error == "VMM has stopped" => break,
-                        Err(error) => fatal(error),
                     }
                 }
-            }
-            let mut candidates = worker_pager.lock().unwrap_or_else(|_| fatal("pager poisoned")).candidates();
-            let sampled = quiesce_nonempty(&mut candidates, |candidates| handle.ram_quiesced(|_| {
-                Ok(worker_pager.lock().map_err(|_| "pager poisoned")?.sample_candidates(candidates))
-            }));
-            let batch = match sampled {
-                Ok(Some(batch)) => batch,
-                Ok(None) => {
-                    // Flush deferred store releases and check owner health even
-                    // when no RAM is eligible. No pager lock or VM barrier is
-                    // held here; release itself performs no publication IPC.
-                    pool.lock().unwrap_or_else(|_| fatal("store poisoned")).stats().unwrap_or_else(|error| fatal(error));
-                    continue;
-                },
-                Err(error) if error == "VMM has stopped" => break,
-                Err(error) => fatal(error),
-            };
-            let mut objects = Vec::new();
-            let mut put_rejections = 0;
-            for snapshot in &batch.0 {
-                // Neither VMM/barrier nor pager state is held during publication.
-                let object = publish_snapshot(&worker_pager, &pool, snapshot)
-                    .unwrap_or_else(|error| fatal(error));
-                if let Some(object) = object {
-                    objects.push((snapshot, Some(object)));
-                } else {
-                    put_rejections += 1;
-                }
-            }
-            worker_pager.lock().unwrap_or_else(|_| fatal("pager poisoned")).put_rejections += put_rejections;
-            let committed = quiesce_nonempty(&mut objects, |objects| handle.ram_quiesced(|_| {
-                let mut pager = worker_pager.lock().map_err(|_| "pager poisoned")?;
-                for (snapshot, object) in objects {
-                    // Successful publication still needs the live-byte recheck
-                    // under the second barrier before destructive discard.
-                    if let Some(published) = object.take() {
-                        *object = pager.commit(snapshot, published).map_err(|error| error.to_string())?;
+                let mut candidates = worker_pager
+                    .lock()
+                    .unwrap_or_else(|_| fatal("pager poisoned"))
+                    .candidates();
+                let sampled = quiesce_nonempty(&mut candidates, |candidates| {
+                    handle.ram_quiesced(|_| {
+                        Ok(worker_pager
+                            .lock()
+                            .map_err(|_| "pager poisoned")?
+                            .sample_candidates(candidates))
+                    })
+                });
+                let batch = match sampled {
+                    Ok(Some(batch)) => batch,
+                    Ok(None) => {
+                        // Flush deferred store releases and check owner health even
+                        // when no RAM is eligible. No pager lock or VM barrier is
+                        // held here; release itself performs no publication IPC.
+                        pool.lock()
+                            .unwrap_or_else(|_| fatal("store poisoned"))
+                            .stats()
+                            .unwrap_or_else(|error| fatal(error));
+                        continue;
+                    }
+                    Err(error) if error == "VMM has stopped" => break,
+                    Err(error) => fatal(error),
+                };
+                let mut objects = Vec::new();
+                let mut put_rejections = 0;
+                for snapshot in &batch.0 {
+                    // Neither VMM/barrier nor pager state is held during publication.
+                    let object = publish_snapshot(&worker_pager, &pool, snapshot)
+                        .unwrap_or_else(|error| fatal(error));
+                    if let Some(object) = object {
+                        objects.push((snapshot, Some(object)));
+                    } else {
+                        put_rejections += 1;
                     }
                 }
-                Ok(())
-            }));
-            for object in objects.into_iter().filter_map(|(_, object)| object) {
-                pool.lock().unwrap_or_else(|_| fatal("store poisoned")).release(object).unwrap_or_else(|error| fatal(error));
-            }
-            match committed {
-                Ok(_) => {},
-                Err(error) if error == "VMM has stopped" => break,
-                Err(error) => fatal(error),
+                // Count publication even if VM teardown cancels the second barrier.
+                metrics.batches += 1;
+                metrics.snapshots += batch.0.len() as u64;
+                worker_pager
+                    .lock()
+                    .unwrap_or_else(|_| fatal("pager poisoned"))
+                    .put_rejections += put_rejections;
+                let committed = quiesce_nonempty(&mut objects, |objects| {
+                    handle.ram_quiesced(|_| {
+                        let mut pager = worker_pager.lock().map_err(|_| "pager poisoned")?;
+                        for (snapshot, object) in objects {
+                            // Successful publication still needs the live-byte recheck
+                            // under the second barrier before destructive discard.
+                            if let Some(published) = object.take() {
+                                *object = pager
+                                    .commit(snapshot, published)
+                                    .map_err(|error| error.to_string())?;
+                            }
+                        }
+                        Ok(())
+                    })
+                });
+                for object in objects.into_iter().filter_map(|(_, object)| object) {
+                    pool.lock()
+                        .unwrap_or_else(|_| fatal("store poisoned"))
+                        .release(object)
+                        .unwrap_or_else(|error| fatal(error));
+                }
+                match committed {
+                    Ok(_) => {}
+                    Err(error) if error == "VMM has stopped" => break,
+                    Err(error) => fatal(error),
+                }
+                if options.metrics && metrics.due(Instant::now()) {
+                    metrics.report(&worker_pager, &pool, batch.0.len(), false);
+                }
             }
             if options.metrics {
-                // Pool RPCs never run with the pager or VM barrier held. Pool
-                // counters are current pool-wide values, not VM physical savings.
-                let stats = pool.lock().unwrap_or_else(|_| fatal("store poisoned")).stats().unwrap_or_else(|error| fatal(error));
-                let pager = worker_pager.lock().unwrap_or_else(|_| fatal("pager poisoned"));
-                let cold: u64 = pager.pages.iter().enumerate().filter(|(_, page)| page.cold.is_some()).map(|(index, _)| pager.pages.range(index).len).sum();
-                eprintln!("pvisor-cold-linux cold_bytes_current={cold} discarded_bytes_total={} restored_bytes_total={} invalidated_total={} put_rejections_total={} restore_count_total={} restore_time_us_total={} restore_time_us_max={} snapshots_batch={} pool_encoded_bytes_current={} pool_objects_current={} pool_session_references_current={} pool_cross_session_objects_current={} pid={}",
-                    pager.discarded, pager.restored, pager.rejected, pager.put_rejections,
-                    pager.restore_count, pager.restore_total_us, pager.restore_max_us,
-                    batch.0.len(), stats.encoded_bytes, stats.objects, stats.session_references,
-                    stats.cross_session_objects, std::process::id());
-                if let Some(scanner) = &pager.shared_scan {
-                    scanner.report(pager.file_hint_candidates);
-                }
+                metrics.report(&worker_pager, &pool, 0, true);
             }
-        }
-        worker_pager.lock().unwrap_or_else(|_| fatal("pager poisoned")).shutdown().unwrap_or_else(|error| fatal(error));
-        worker_stop.store(true, Ordering::Release);
-    });
+            worker_pager
+                .lock()
+                .unwrap_or_else(|_| fatal("pager poisoned"))
+                .shutdown()
+                .unwrap_or_else(|error| fatal(error));
+            worker_stop.store(true, Ordering::Release);
+        });
     if let Err(error) = worker {
         stop.store(true, Ordering::Release);
         if let Some(resolver) = resolver {
@@ -1297,6 +1726,9 @@ pub(crate) fn start<S: ColdRamStore + 'static>(
                 .map_err(|_| io::Error::other("UFFD resolver panicked"))?;
         }
         pager.lock().unwrap().shutdown()?;
+        *reclaim_hook
+            .lock()
+            .map_err(|_| io::Error::other("shared backing hook poisoned"))? = None;
         reservation.store(false, Ordering::Release);
         return Err(error);
     }
@@ -1310,6 +1742,24 @@ mod tests {
     use crate::api::ColdRamPoolStats;
     use std::io::{Read, Write};
     use vm_memory::{Bytes, GuestAddress};
+
+    #[test]
+    fn metrics_cadence_limits_full_censuses_without_losing_batch_totals() {
+        let mut metrics = PagerMetrics::new(false);
+        let start = Instant::now();
+        assert!(metrics.due(start));
+        metrics.last = Some(start);
+        for ms in 1..1000 {
+            metrics.batches += 1;
+            metrics.snapshots += 128;
+            assert!(!metrics.due(start + Duration::from_millis(ms)));
+        }
+        assert!(metrics.due(start + Duration::from_secs(1)));
+        assert_eq!(metrics.batches, 999);
+        assert_eq!(metrics.snapshots, 999 * 128);
+        metrics.every_batch = true;
+        assert!(metrics.due(start));
+    }
 
     #[derive(Default)]
     struct CompressedStore {
@@ -1430,6 +1880,10 @@ mod tests {
             .unwrap();
         let pages = host_sorted_pages(&ranges(&memory, u64::MAX).unwrap(), Instant::now(), 4096);
         Pager {
+            shared_backing: false,
+            replaced: Default::default(),
+            generation: 0,
+            retired: Vec::new(),
             memory,
             shared_scan: Some(pages.shared_scanner(0)),
             read_hints: Some(Arc::new(ReadHints::default())),
@@ -1449,6 +1903,339 @@ mod tests {
             restore_max_us: 0,
         }
     }
+    fn backed_shared_pager(store: Arc<Mutex<SharedStore>>) -> Pager<SharedStore> {
+        backed_shared_pager_with_size(store, 8192)
+    }
+    fn backed_shared_pager_with_size(
+        store: Arc<Mutex<SharedStore>>,
+        size: usize,
+    ) -> Pager<SharedStore> {
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        let memory = crate::vmm::ram::map(&[(GuestAddress(0), size)], &[], file).unwrap();
+        memory
+            .write_slice(&vec![0x5a; size], GuestAddress(0))
+            .unwrap();
+        let mappings = ranges_for_profile(&memory, u64::MAX, None, true).unwrap();
+        let pages = host_sorted_pages(&mappings, Instant::now(), 4096);
+        let mut pager = shared_pager();
+        pager.memory = memory;
+        pager.shared_scan = Some(pages.shared_scanner(0));
+        pager.pages = pages;
+        pager.shared_backing = true;
+        pager.store = store;
+        pager
+    }
+    fn share_page(pager: &mut Pager<SharedStore>, index: usize) {
+        let range = pager.pages.range(index);
+        let snapshot = Snapshot {
+            generation: pager.generation,
+            index,
+            bytes: unsafe { std::slice::from_raw_parts(range.start as *const u8, 4096) }.to_vec(),
+        };
+        let object = pager.store.lock().unwrap().put(&snapshot.bytes).unwrap();
+        if let Some(previous) = pager.commit(&snapshot, object).unwrap() {
+            pager.store.lock().unwrap().release(previous).unwrap();
+        }
+    }
+    #[test]
+    fn shared_backing_diagnostic_classifies_content_without_changing_authority() {
+        let mut a =
+            backed_shared_pager_with_size(Arc::new(Mutex::new(SharedStore::default())), 4 * 4096);
+        for index in 0..4 {
+            share_page(&mut a, index);
+        }
+        a.memory.write_slice(&[0x31], GuestAddress(4096)).unwrap();
+        a.memory
+            .write_slice(&[0; 4096], GuestAddress(8192))
+            .unwrap();
+        a.retired.push(*a.pages[3].cold.take().unwrap());
+        let generation = a.generation;
+        let stats = a.diagnose_reattach();
+        for key in [
+            "nonzero_equal_pinned_bytes",
+            "nonzero_different_pinned_bytes",
+            "live_zero_bytes",
+            "nonzero_without_pin_bytes",
+        ] {
+            assert_eq!(stats[key], 4096);
+        }
+        assert_eq!(stats["unknown_bytes"], 0);
+        assert_eq!(stats["tracked_bytes"], 16384);
+        assert_eq!(a.generation, generation);
+        assert_eq!(a.replaced.len(), 4);
+        assert_eq!(a.retired.len(), 1);
+        a.reattach_backing().unwrap();
+        crate::vmm::ram::reclaim(&a.memory).unwrap();
+        assert_eq!(a.memory.read_obj::<u8>(GuestAddress(4096)).unwrap(), 0x31);
+    }
+
+    #[test]
+    fn shared_backing_nonzero_batch_limit_preserves_tail() {
+        let size = 4097 * 4096;
+        let mut a =
+            backed_shared_pager_with_size(Arc::new(Mutex::new(SharedStore::default())), size);
+        a.release_free_pages(&[(0, size)]).unwrap();
+        let mut expected = vec![0x31; size];
+        expected[size - 1] = 0x79;
+        a.memory.write_slice(&expected, GuestAddress(0)).unwrap();
+        a.reattach_backing().unwrap();
+        assert!(a.replaced.is_empty());
+        crate::vmm::ram::reclaim(&a.memory).unwrap();
+        let mut actual = vec![0; size];
+        a.memory.read_slice(&mut actual, GuestAddress(0)).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn shared_backing_batched_nonzero_preserves_zero_gaps_and_cow_bytes() {
+        let mut a =
+            backed_shared_pager_with_size(Arc::new(Mutex::new(SharedStore::default())), 8 * 4096);
+        for index in [0, 1, 2, 3, 5, 6, 7] {
+            share_page(&mut a, index);
+            a.memory
+                .write_slice(&[index as u8 + 1], GuestAddress(index as u64 * 4096 + 17))
+                .unwrap();
+        }
+        a.memory
+            .write_slice(&[0; 4096], GuestAddress(2 * 4096))
+            .unwrap();
+        let mut expected = vec![0; 8 * 4096];
+        a.memory.read_slice(&mut expected, GuestAddress(0)).unwrap();
+        a.reattach_backing().unwrap();
+        assert!(a.replaced.is_empty());
+        assert_eq!(a.retired.len(), 7);
+        crate::vmm::ram::reclaim(&a.memory).unwrap();
+        let mut actual = vec![0; expected.len()];
+        a.memory.read_slice(&mut actual, GuestAddress(0)).unwrap();
+        assert_eq!(actual, expected);
+        a.reattach_backing().unwrap();
+        crate::vmm::ram::reclaim(&a.memory).unwrap();
+        a.memory.read_slice(&mut actual, GuestAddress(0)).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn shared_backing_sparse_free_pages_preserve_reused_cow_and_neighbors() {
+        use std::os::unix::fs::MetadataExt;
+        let mut a =
+            backed_shared_pager_with_size(Arc::new(Mutex::new(SharedStore::default())), 64 * 4096);
+        let file = a
+            .memory
+            .iter()
+            .next()
+            .unwrap()
+            .file_offset()
+            .unwrap()
+            .file()
+            .try_clone()
+            .unwrap();
+        crate::vmm::ram::reclaim(&a.memory).unwrap();
+        let allocated = file.metadata().unwrap().blocks();
+        a.release_free_pages(&[(4096, 62 * 4096)]).unwrap();
+        // The guest reused one page after reporting it free. Another page was
+        // published to the shared pool then privately modified.
+        a.memory
+            .write_slice(&[0x31], GuestAddress(3 * 4096 + 7))
+            .unwrap();
+        share_page(&mut a, 5);
+        a.memory
+            .write_slice(&[0x42], GuestAddress(5 * 4096 + 11))
+            .unwrap();
+        a.reattach_backing().unwrap();
+        assert!(a.replaced.is_empty());
+        crate::vmm::ram::reclaim(&a.memory).unwrap();
+        assert!(file.metadata().unwrap().blocks() < allocated / 2);
+        let mut expected = vec![0; 64 * 4096];
+        expected[..4096].fill(0x5a);
+        expected[63 * 4096..].fill(0x5a);
+        expected[3 * 4096 + 7] = 0x31;
+        expected[5 * 4096 + 11] = 0x42;
+        let mut actual = vec![0; expected.len()];
+        a.memory.read_slice(&mut actual, GuestAddress(0)).unwrap();
+        assert_eq!(actual, expected);
+        a.reattach_backing().unwrap();
+        crate::vmm::ram::reclaim(&a.memory).unwrap();
+        a.memory.read_slice(&mut actual, GuestAddress(0)).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn shared_backing_sparse_zero_failure_keeps_mapping_and_pending_pages() {
+        use std::os::fd::AsRawFd;
+        let mut a = backed_shared_pager(Arc::new(Mutex::new(SharedStore::default())));
+        a.release_free_pages(&[(0, 4096)]).unwrap();
+        let fd = a
+            .memory
+            .iter()
+            .next()
+            .unwrap()
+            .file_offset()
+            .unwrap()
+            .file()
+            .as_raw_fd();
+        let readonly = std::fs::File::open(format!("/proc/self/fd/{fd}")).unwrap();
+        assert_eq!(unsafe { libc::dup2(readonly.as_raw_fd(), fd) }, fd);
+        assert!(a.reattach_backing().is_err());
+        assert!(a.replaced.contains(&0));
+        assert_eq!(a.memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 0);
+        assert_eq!(a.memory.read_obj::<u8>(GuestAddress(4096)).unwrap(), 0x5a);
+    }
+
+    #[test]
+    fn shared_backing_two_owners_cow_reclaim_resume_and_independent_exit() {
+        let store = Arc::new(Mutex::new(SharedStore::default()));
+        let mut a = backed_shared_pager(store.clone());
+        let mut b = backed_shared_pager(store.clone());
+        for cycle in 0..3u8 {
+            share_page(&mut a, 0);
+            share_page(&mut b, 0);
+            a.memory.write_slice(&[cycle + 1], GuestAddress(0)).unwrap();
+            assert_eq!(b.memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x5a);
+            a.reattach_backing().unwrap();
+            assert!(a.replaced.is_empty());
+            crate::vmm::ram::reclaim(&a.memory).unwrap();
+            assert_eq!(a.memory.read_obj::<u8>(GuestAddress(0)).unwrap(), cycle + 1);
+            assert_eq!(b.memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x5a);
+            a.memory.write_slice(&[0x5a], GuestAddress(0)).unwrap();
+        }
+        a.shutdown().unwrap();
+        drop(a);
+        b.memory.write_slice(&[0x33], GuestAddress(0)).unwrap();
+        b.reattach_backing().unwrap();
+        crate::vmm::ram::reclaim(&b.memory).unwrap();
+        assert_eq!(b.memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x33);
+        b.shutdown().unwrap();
+    }
+    #[test]
+    fn shared_backing_invalidates_inflight_publication_and_preserves_zero_pages() {
+        let mut a = backed_shared_pager(Arc::new(Mutex::new(SharedStore::default())));
+        share_page(&mut a, 0);
+        let stale = Snapshot {
+            generation: a.generation,
+            index: 1,
+            bytes: vec![0x5a; 4096],
+        };
+        let object = a.store.lock().unwrap().put(&stale.bytes).unwrap();
+        let retired = a.release_free_pages(&[(0, 4096)]).unwrap();
+        assert!(!retired.is_empty());
+        a.reattach_backing().unwrap();
+        assert!(a.commit(&stale, object).unwrap().is_some());
+        crate::vmm::ram::reclaim(&a.memory).unwrap();
+        let mut bytes = vec![1; 4096];
+        a.memory.read_slice(&mut bytes, GuestAddress(0)).unwrap();
+        assert_eq!(bytes, vec![0; 4096]);
+        assert_eq!(a.memory.read_obj::<u8>(GuestAddress(4096)).unwrap(), 0x5a);
+    }
+    #[test]
+    fn shared_backing_write_failure_retains_mapping_and_pin() {
+        use std::os::fd::AsRawFd;
+        let mut a = backed_shared_pager(Arc::new(Mutex::new(SharedStore::default())));
+        share_page(&mut a, 0);
+        share_page(&mut a, 1);
+        a.memory.write_slice(&[0x31], GuestAddress(0)).unwrap();
+        let fd = a
+            .memory
+            .iter()
+            .next()
+            .unwrap()
+            .file_offset()
+            .unwrap()
+            .file()
+            .as_raw_fd();
+        let readonly = std::fs::File::open(format!("/proc/self/fd/{fd}")).unwrap();
+        assert_eq!(unsafe { libc::dup2(readonly.as_raw_fd(), fd) }, fd);
+        assert!(a.reattach_backing().is_err());
+        assert!(a.replaced.contains(&0));
+        assert!(a.pages[0].cold.is_some());
+        assert!(a.replaced.contains(&1));
+        assert!(a.pages[1].cold.is_some());
+        assert!(a.retired.is_empty());
+        assert_eq!(a.memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x31);
+    }
+
+    #[test]
+    fn shared_backing_reclaims_nonzero_offset_without_overwriting_other_pages() {
+        let mut a = backed_shared_pager(Arc::new(Mutex::new(SharedStore::default())));
+        // The second page must be restored at its backing offset, not offset zero.
+        let address = a.pages.range(1).start;
+        let region = a
+            .memory
+            .iter()
+            .find(|r| address >= r.as_ptr() as u64 && address < r.as_ptr() as u64 + r.len())
+            .unwrap();
+        let guest = GuestAddress(region.start_addr().0 + address - region.as_ptr() as u64);
+        assert_eq!(guest.0, 4096);
+        share_page(&mut a, 1);
+        a.memory.write_slice(&[0x31; 4096], guest).unwrap();
+        a.reattach_backing().unwrap();
+        crate::vmm::ram::reclaim(&a.memory).unwrap();
+        let mut bytes = [0; 8192];
+        a.memory.read_slice(&mut bytes, GuestAddress(0)).unwrap();
+        assert_eq!(&bytes[..4096], &[0x5a; 4096]);
+        assert_eq!(&bytes[4096..], &[0x31; 4096]);
+        assert!(a.replaced.is_empty());
+        assert_eq!(a.retired.len(), 1);
+        // A second offload without newly replaced pages must not retire twice.
+        a.reattach_backing().unwrap();
+        assert_eq!(a.retired.len(), 1);
+    }
+
+    #[test]
+    fn shared_backing_preserves_cow_after_pool_reference_was_retired() {
+        let mut a = backed_shared_pager(Arc::new(Mutex::new(SharedStore::default())));
+        share_page(&mut a, 0);
+        a.memory.write_slice(&[0x32], GuestAddress(0)).unwrap();
+        // A scan may retire a proven private COW page's pool reference before
+        // offload. The separate replaced-page ledger must retain this page.
+        let object = a.pages[0].cold.take().unwrap();
+        a.store.lock().unwrap().release(*object).unwrap();
+        assert!(a.replaced.contains(&0));
+        a.reattach_backing().unwrap();
+        crate::vmm::ram::reclaim(&a.memory).unwrap();
+        assert_eq!(a.memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x32);
+        assert!(a.retired.is_empty()); // no duplicate release
+        assert!(a.replaced.is_empty());
+    }
+
+    #[test]
+    fn shared_backing_generation_exhaustion_leaves_mapping_and_pin_intact() {
+        let mut a = backed_shared_pager(Arc::new(Mutex::new(SharedStore::default())));
+        share_page(&mut a, 0);
+        a.memory.write_slice(&[0x31], GuestAddress(0)).unwrap();
+        a.generation = u64::MAX;
+        assert!(
+            a.reattach_backing()
+                .unwrap_err()
+                .to_string()
+                .contains("generation exhausted")
+        );
+        assert!(a.replaced.contains(&0));
+        assert!(a.pages[0].cold.is_some());
+        assert!(a.retired.is_empty());
+        assert_eq!(a.memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x31);
+    }
+
+    #[test]
+    fn shared_backing_rejects_anonymous_and_requires_explicit_profile() {
+        let a = shared_pager();
+        assert!(ranges_for_profile(&a.memory, u64::MAX, None, true).is_err());
+        let a = backed_shared_pager(Arc::new(Mutex::new(SharedStore::default())));
+        assert!(ranges_for_profile(&a.memory, u64::MAX, None, false).is_err());
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        file.set_len(4096).unwrap();
+        let region = vm_memory::mmap::MmapRegionBuilder::new(4096)
+            .with_file_offset(vm_memory::FileOffset::from_arc(file, 0))
+            .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
+            .with_mmap_flags(libc::MAP_PRIVATE)
+            .build()
+            .unwrap();
+        let memory = GuestMemoryMmap::from_regions(vec![
+            vm_memory::GuestRegionMmap::new(region, GuestAddress(0)).unwrap(),
+        ])
+        .unwrap();
+        assert!(ranges_for_profile(&memory, u64::MAX, None, true).is_err());
+    }
+
     #[test]
     fn configured_shared_ram_metadata_stays_within_two_mib_for_512_mib() {
         let pages = host_sorted_pages::<Arc<std::fs::File>>(
@@ -1474,6 +2261,7 @@ mod tests {
         // The reported range has both still-shared and privately written COW pages.
         for index in BLOCK / 4096..2 * BLOCK / 4096 {
             let snapshot = Snapshot {
+                generation: 0,
                 index,
                 bytes: vec![0x5a; 4096],
             };
@@ -1880,6 +2668,10 @@ mod tests {
         }
         let pages = host_sorted_pages(&mappings, Instant::now(), BLOCK);
         Pager {
+            shared_backing: false,
+            replaced: Default::default(),
+            generation: 0,
+            retired: Vec::new(),
             memory,
             shared_scan: None,
             read_hints: None,
@@ -2324,6 +3116,7 @@ mod tests {
             state
                 .commit(
                     &Snapshot {
+                        generation: 0,
                         index: 1,
                         bytes: expected.clone()
                     },
