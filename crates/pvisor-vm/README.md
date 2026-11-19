@@ -2168,3 +2168,8 @@ A reporting interval is not a bound on scanning CPU or a claim of net RAM saving
 
 Diagnostic `unix_us` provides a wall-clock sample for phase alignment; use local
 `elapsed_us` for durations because the wall clock can be adjusted.
+
+Linux cold pagers may be installed in the initially paused ready callback.
+Installation does not resume CPUs; scan barriers skip paused machines until
+the builder or owner resumes them. Compact restored RAM and conflicting device
+preparation or dedup advice remain rejected.

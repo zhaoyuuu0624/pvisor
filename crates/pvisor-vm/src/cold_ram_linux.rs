@@ -1362,12 +1362,11 @@ pub(crate) fn start<S: ColdRamStore + 'static>(
             .lock()
             .map_err(|_| io::Error::other("VMM lock poisoned"))?;
         if locked.has_compact_restore_ram()
-            || locked.is_paused()
             || locked.device_memory_gate().has_prepare()
             || locked.device_memory_gate().has_dedup_advice()
         {
             return Err(io::Error::other(
-                "Linux cold RAM requires running VM without device preparation or RAM dedup advice",
+                "Linux cold RAM requires ordinary VM RAM without device preparation or RAM dedup advice",
             ));
         }
         let memory = locked.guest_memory().clone();
@@ -1405,7 +1404,7 @@ pub(crate) fn start<S: ColdRamStore + 'static>(
         };
         let faults = Arc::new(crate::devices::virtio::memory_gate::ColdFaultActivity::default());
         let pages = handle
-            .ram_quiesced(|vmm| {
+            .register_cold_ram(|vmm| {
                 // Disable the other destructive RAM owner before registration.
                 // A closed idle gate guarantees every old balloon lease drained.
                 vmm.device_memory_gate()

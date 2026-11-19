@@ -109,6 +109,34 @@ impl VmmHandle {
         Ok(locked.experimental_ram_residency())
     }
 
+    /// Install the Linux pager before initial CPU resume. A paused VM remains
+    /// paused with its device gate closed; the owner controls the first resume.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) fn register_cold_ram<T>(
+        &self,
+        action: impl FnOnce(&mut vmm::Vmm) -> Result<T, String>,
+    ) -> Result<Option<T>, String> {
+        {
+            let _transition = self.transition.lock().map_err(|_| "VM transition lock poisoned")?;
+            let vmm = self.vmm.upgrade().ok_or("VMM has stopped")?;
+            let mut locked = vmm.lock().map_err(|_| "VMM lock poisoned")?;
+            if locked.is_paused() {
+                match locked.device_memory_gate().try_close() {
+                    Ok(true) => {},
+                    Ok(false) => return Ok(None),
+                    Err(error) => {
+                        locked.fail_control();
+                        return Err(error.into());
+                    }
+                }
+                let result = action(&mut locked);
+                if result.is_err() { locked.fail_control(); }
+                return result.map(Some);
+            }
+        }
+        self.ram_quiesced(action)
+    }
+
     /// Experimental optional mapping transaction. None skips a paused VM or
     /// busy devices without invoking action. Mapping errors park the VM.
     #[cfg(any(target_os = "macos", all(target_os = "linux", target_arch = "x86_64")))]

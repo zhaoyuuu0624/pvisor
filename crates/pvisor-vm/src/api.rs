@@ -575,6 +575,8 @@ pub trait ColdRamControl: VmControl {
     /// rechecked before remapping. Snapshots are bounded to 4 MiB per batch.
     /// The worker lives with the runner; a failed mapping transition terminates
     /// that runner. Call once, before allowing control requests or guest work.
+    /// Linux supports installation in the initially paused ready callback;
+    /// installation never resumes CPUs, and maintenance skips paused machines.
     fn start_cold_pager<S: ColdRamStore + 'static>(
         &self,
         store: S,
